@@ -1,0 +1,134 @@
+name: ghsec-c-cache-probe
+# Workstream C, cache-control calibration cell.
+# Question: does an UNTRUSTED trigger (pull_request_target, which executes in the
+# default-branch context) retain the ability to WRITE the shared default-branch
+# Actions cache, after the 2026-06-26 "read-only Actions cache for untrusted
+# triggers" change?
+# Three angles, all echo-only, no secret is read or printed:
+#   1. the actions/cache@v4 client (documented: warning + silent skip)
+#   2. a raw reserve/upload/commit against the cache service with the run's own
+#      ACTIONS_RUNTIME_TOKEN (tests whether the control is service-enforced)
+#   3. a trusted workflow_dispatch consumer that tries to restore the same key
+# The token value is never printed; only HTTP status codes and the service host.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  untrusted-writer:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: context facts
+        run: |
+          echo "EVENT=$GITHUB_EVENT_NAME"
+          echo "REF=$GITHUB_REF"
+          echo "REF_NAME=$GITHUB_REF_NAME"
+          echo "SHA=$GITHUB_SHA"
+          echo "HEAD_REPO=${{ github.event.pull_request.head.repo.full_name }}"
+          echo "BASE_REPO=${{ github.event.pull_request.base.repo.full_name }}"
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}"
+
+      - name: prepare cache dir
+        run: |
+          mkdir -p .ghsec-c-cache
+          echo "ghsec-c-pt-marker-run-$GITHUB_RUN_ID" > .ghsec-c-cache/marker.txt
+
+      - name: cache client save attempt (actions/cache v4)
+        uses: actions/cache@v4
+        with:
+          path: .ghsec-c-cache
+          key: ghsec-c-pt-v4
+
+      - name: raw cache-service write probe
+        env:
+          RAW_KEY: ghsec-c-pt-raw
+        run: |
+          set -uo pipefail
+          CACHE_HOST="$(printf '%s' "${ACTIONS_CACHE_URL:-}" | sed -E 's#^(https?://[^/]+).*#\1#')"
+          echo "CACHE_HOST=${CACHE_HOST:-<unset>}"
+          echo "CACHE_SERVICE_V2_FLAG=${ACTIONS_CACHE_SERVICE_V2:-<unset>}"
+          echo "RESULTS_URL_HOST=$(printf '%s' "${ACTIONS_RESULTS_URL:-}" | sed -E 's#^(https?://[^/]+).*#\1#')"
+          echo "RUNTIME_TOKEN_PRESENT=$([ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] && echo YES || echo NO)"
+          VER="$(printf '%s' '.ghsec-c-cache' | sha256sum | cut -d' ' -f1)"
+          echo "PROBE_VERSION_GUESS=$VER"
+          code=$(curl -sS -o /tmp/reserve.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -H "Content-Type: application/json" \
+            -d "{\"key\":\"$RAW_KEY\",\"version\":\"$VER\"}" \
+            "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches" 2>/dev/null || echo ERR)
+          echo "RAW_RESERVE_HTTP=$code"
+          echo "RAW_RESERVE_BODY=$(head -c 200 /tmp/reserve.json 2>/dev/null)"
+          cid=$(sed -nE 's/.*"cacheId"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' /tmp/reserve.json 2>/dev/null | head -1)
+          echo "RAW_CACHE_ID=${cid:-none}"
+          if [ -n "${cid:-}" ]; then
+            printf 'ghsec-c-raw-payload' > /tmp/blob.bin
+            size=$(stat -c%s /tmp/blob.bin)
+            up=$(curl -sS -o /tmp/up.txt -w '%{http_code}' -X PATCH \
+              -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              -H "Content-Type: application/octet-stream" \
+              -H "Content-Range: bytes 0-$((size-1))/*" \
+              --data-binary @/tmp/blob.bin \
+              "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
+            echo "RAW_UPLOAD_HTTP=$up"
+            cm=$(curl -sS -o /tmp/commit.txt -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              -H "Content-Type: application/json" \
+              -d "{\"size\":$size}" \
+              "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
+            echo "RAW_COMMIT_HTTP=$cm"
+            echo "RAW_COMMIT_BODY=$(head -c 200 /tmp/commit.txt 2>/dev/null)"
+          fi
+
+  trusted-writer:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: prepare dir
+        run: |
+          mkdir -p .ghsec-c-ctl
+          echo "ghsec-c-ctl-marker" > .ghsec-c-ctl/marker.txt
+      - name: positive-control save (trusted context)
+        uses: actions/cache@v4
+        with:
+          path: .ghsec-c-ctl
+          key: ghsec-c-ctl-v4
+
+  trusted-consumer:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [trusted-writer]
+    runs-on: ubuntu-latest
+    steps:
+      - name: restore the key an untrusted trigger tried to write
+        id: r1
+        uses: actions/cache@v4
+        with:
+          path: .ghsec-c-cache
+          key: ghsec-c-pt-v4
+      - name: restore the positive-control key
+        id: r2
+        uses: actions/cache@v4
+        with:
+          path: .ghsec-c-ctl
+          key: ghsec-c-ctl-v4
+      - name: raw list probe (read, version hash disclosure)
+        env:
+          RAW_KEY: ghsec-c-pt-raw
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o /tmp/list.json -w '%{http_code}' \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches?keys=$RAW_KEY" 2>/dev/null || echo ERR)
+          echo "RAW_LIST_HTTP=$code"
+          echo "RAW_LIST_BODY=$(head -c 400 /tmp/list.json 2>/dev/null)"
+      - name: report
+        run: |
+          echo "CONSUMER_UNTRUSTED_KEY_HIT=${{ steps.r1.outputs.cache-hit }}"
+          if [ -f .ghsec-c-cache/marker.txt ]; then echo "CONSUMER_UNTRUSTED_MARKER=$(cat .ghsec-c-cache/marker.txt)"; else echo "CONSUMER_UNTRUSTED_MARKER=ABSENT"; fi
+          echo "CONSUMER_CONTROL_KEY_HIT=${{ steps.r2.outputs.cache-hit }}"
+          if [ -f .ghsec-c-ctl/marker.txt ]; then echo "CONSUMER_CONTROL_MARKER=$(cat .ghsec-c-ctl/marker.txt)"; else echo "CONSUMER_CONTROL_MARKER=ABSENT"; fi
