@@ -1,0 +1,47 @@
+name: ghsec-c-forkpr
+# Workstream C probe: fork-PR GITHUB_TOKEN scope. Lives on the BASE default branch.
+# Reports derived facts only (scopes header, probe statuses, secret presence).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: token-scope-probe
+        env:
+          GH_TOKEN_VALUE: ${{ github.token }}
+          SELF_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          VICTIM_PRIVATE: dinhvaren8-ui/ghsec-alpha
+          OTHER_PUBLIC: dangga2073-design/ghsec-attacker
+          OTHER_PRIVATE: dangga2073-design/ghsec-c-attacker-private
+          CANARY: ${{ secrets.GH_ACTIONS_CANARY }}
+        run: |
+          set -uo pipefail
+          probe() {
+            local label="$1" path="$2" code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN_VALUE" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com$path" 2>/dev/null || echo ERR)
+            echo "PROBE $label $path -> $code"
+          }
+          echo "=== C-fork-PR-token scope report (derived facts only) ==="
+          echo "SELF_REPO=$SELF_REPO HEAD_REPO=$HEAD_REPO IS_FORK=$IS_FORK"
+          curl -sS -D /tmp/h.txt -o /dev/null -H "Authorization: Bearer $GH_TOKEN_VALUE" \
+            -H "Accept: application/vnd.github+json" https://api.github.com/repos/$SELF_REPO >/dev/null 2>&1 || true
+          echo "SCOPES_HEADER: $(grep -i '^x-oauth-scopes:' /tmp/h.txt || echo '<absent>')"
+          echo "ACCEPTED_PERMS: $(grep -i '^x-accepted-github-permissions:' /tmp/h.txt || echo '<absent>')"
+          probe self                    "/repos/$SELF_REPO"
+          probe self_secrets            "/repos/$SELF_REPO/actions/secrets"
+          probe self_variables          "/repos/$SELF_REPO/actions/variables"
+          probe victim_private          "/repos/$VICTIM_PRIVATE"
+          probe victim_private_secrets  "/repos/$VICTIM_PRIVATE/actions/secrets"
+          probe other_public            "/repos/$OTHER_PUBLIC"
+          probe other_private           "/repos/$OTHER_PRIVATE"
+          probe user                    "/user"
+          if [ -n "${CANARY:-}" ]; then echo "SECRET_CANARY: PRESENT len=${#CANARY}"; else echo "SECRET_CANARY: ABSENT"; fi
+          echo "=== end report ==="
