@@ -1,15 +1,11 @@
 name: ghsec-c-cache-probe
-# Workstream C, cache-control calibration cell.
+# Workstream C, cache-control calibration cell (v2: robust to unset credential vars).
 # Question: does an UNTRUSTED trigger (pull_request_target, which executes in the
 # default-branch context) retain the ability to WRITE the shared default-branch
 # Actions cache, after the 2026-06-26 "read-only Actions cache for untrusted
 # triggers" change?
-# Three angles, all echo-only, no secret is read or printed:
-#   1. the actions/cache@v4 client (documented: warning + silent skip)
-#   2. a raw reserve/upload/commit against the cache service with the run's own
-#      ACTIONS_RUNTIME_TOKEN (tests whether the control is service-enforced)
-#   3. a trusted workflow_dispatch consumer that tries to restore the same key
-# The token value is never printed; only HTTP status codes and the service host.
+# Echo-only. No secret is read. Only HTTP status codes, the service host and
+# presence booleans are emitted; the token value is never printed.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
@@ -30,6 +26,13 @@ jobs:
           echo "BASE_REPO=${{ github.event.pull_request.base.repo.full_name }}"
           echo "PR_NUMBER=${{ github.event.pull_request.number }}"
 
+      - name: credential env facts (untrusted context)
+        run: |
+          echo "U_CACHE_URL_SET=$([ -n "${ACTIONS_CACHE_URL:-}" ] && echo YES || echo NO)"
+          echo "U_RUNTIME_TOKEN_SET=$([ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] && echo YES || echo NO)"
+          echo "U_RESULTS_URL_SET=$([ -n "${ACTIONS_RESULTS_URL:-}" ] && echo YES || echo NO)"
+          echo "U_V2_FLAG=${ACTIONS_CACHE_SERVICE_V2:-<unset>}"
+
       - name: prepare cache dir
         run: |
           mkdir -p .ghsec-c-cache
@@ -45,12 +48,13 @@ jobs:
         env:
           RAW_KEY: ghsec-c-pt-raw
         run: |
-          set -uo pipefail
+          set +u
           CACHE_HOST="$(printf '%s' "${ACTIONS_CACHE_URL:-}" | sed -E 's#^(https?://[^/]+).*#\1#')"
           echo "CACHE_HOST=${CACHE_HOST:-<unset>}"
-          echo "CACHE_SERVICE_V2_FLAG=${ACTIONS_CACHE_SERVICE_V2:-<unset>}"
-          echo "RESULTS_URL_HOST=$(printf '%s' "${ACTIONS_RESULTS_URL:-}" | sed -E 's#^(https?://[^/]+).*#\1#')"
-          echo "RUNTIME_TOKEN_PRESENT=$([ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] && echo YES || echo NO)"
+          if [ -z "${ACTIONS_CACHE_URL:-}" ] || [ -z "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+            echo "RAW_PROBE=SKIPPED_NO_CACHE_CREDENTIAL"
+            exit 0
+          fi
           VER="$(printf '%s' '.ghsec-c-cache' | sha256sum | cut -d' ' -f1)"
           echo "PROBE_VERSION_GUESS=$VER"
           code=$(curl -sS -o /tmp/reserve.json -w '%{http_code}' -X POST \
@@ -58,7 +62,7 @@ jobs:
             -H "Accept: application/json;api-version=6.0-preview.1" \
             -H "Content-Type: application/json" \
             -d "{\"key\":\"$RAW_KEY\",\"version\":\"$VER\"}" \
-            "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches" 2>/dev/null || echo ERR)
+            "${ACTIONS_CACHE_URL}_apis/artifactcache/caches" 2>/dev/null || echo ERR)
           echo "RAW_RESERVE_HTTP=$code"
           echo "RAW_RESERVE_BODY=$(head -c 200 /tmp/reserve.json 2>/dev/null)"
           cid=$(sed -nE 's/.*"cacheId"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' /tmp/reserve.json 2>/dev/null | head -1)
@@ -72,14 +76,14 @@ jobs:
               -H "Content-Type: application/octet-stream" \
               -H "Content-Range: bytes 0-$((size-1))/*" \
               --data-binary @/tmp/blob.bin \
-              "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
+              "${ACTIONS_CACHE_URL}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
             echo "RAW_UPLOAD_HTTP=$up"
             cm=$(curl -sS -o /tmp/commit.txt -w '%{http_code}' -X POST \
               -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
               -H "Accept: application/json;api-version=6.0-preview.1" \
               -H "Content-Type: application/json" \
               -d "{\"size\":$size}" \
-              "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
+              "${ACTIONS_CACHE_URL}_apis/artifactcache/caches/$cid" 2>/dev/null || echo ERR)
             echo "RAW_COMMIT_HTTP=$cm"
             echo "RAW_COMMIT_BODY=$(head -c 200 /tmp/commit.txt 2>/dev/null)"
           fi
@@ -88,6 +92,12 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
+      - name: credential env facts (trusted context, positive control)
+        run: |
+          echo "T_CACHE_URL_SET=$([ -n "${ACTIONS_CACHE_URL:-}" ] && echo YES || echo NO)"
+          echo "T_RUNTIME_TOKEN_SET=$([ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] && echo YES || echo NO)"
+          echo "T_RESULTS_URL_SET=$([ -n "${ACTIONS_RESULTS_URL:-}" ] && echo YES || echo NO)"
+          echo "T_V2_FLAG=${ACTIONS_CACHE_SERVICE_V2:-<unset>}"
       - name: prepare dir
         run: |
           mkdir -p .ghsec-c-ctl
@@ -115,17 +125,6 @@ jobs:
         with:
           path: .ghsec-c-ctl
           key: ghsec-c-ctl-v4
-      - name: raw list probe (read, version hash disclosure)
-        env:
-          RAW_KEY: ghsec-c-pt-raw
-        run: |
-          set -uo pipefail
-          code=$(curl -sS -o /tmp/list.json -w '%{http_code}' \
-            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            -H "Accept: application/json;api-version=6.0-preview.1" \
-            "${ACTIONS_CACHE_URL:-none}_apis/artifactcache/caches?keys=$RAW_KEY" 2>/dev/null || echo ERR)
-          echo "RAW_LIST_HTTP=$code"
-          echo "RAW_LIST_BODY=$(head -c 400 /tmp/list.json 2>/dev/null)"
       - name: report
         run: |
           echo "CONSUMER_UNTRUSTED_KEY_HIT=${{ steps.r1.outputs.cache-hit }}"
